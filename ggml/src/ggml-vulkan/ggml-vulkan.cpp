@@ -4215,7 +4215,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
                       << std::endl;
         }
 
-        device_extensions.push_back("VK_KHR_16bit_storage");
+        if (vk11_features.storageBuffer16BitAccess) {
+            device_extensions.push_back("VK_KHR_16bit_storage");
+        }
 
 #ifdef GGML_VULKAN_VALIDATE
         device_extensions.push_back("VK_KHR_shader_non_semantic_info");
