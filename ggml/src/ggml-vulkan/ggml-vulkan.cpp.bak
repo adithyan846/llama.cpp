@@ -4209,10 +4209,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
         }
 
         if (!vk11_features.storageBuffer16BitAccess) {
-            std::cerr << "ggml_vulkan: WARNING: device "
-                      << GGML_VK_NAME << idx
-                      << " does not support 16-bit storage; continuing for testing."
-                      << std::endl;
+            std::cerr << "ggml_vulkan: device " << GGML_VK_NAME << idx << " does not support 16-bit storage." << std::endl;
+            throw std::runtime_error("Unsupported device");
         }
 
         device_extensions.push_back("VK_KHR_16bit_storage");
@@ -13541,7 +13539,7 @@ static bool ggml_vk_device_is_supported(const vk::PhysicalDevice & vkdev) {
 
     vkGetPhysicalDeviceFeatures2(vkdev, &device_features2);
 
-    return true;
+    return vk11_features.storageBuffer16BitAccess;
 }
 
 static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& props, const vk::PhysicalDeviceDriverProperties& driver_props, vk_device_architecture arch) {
