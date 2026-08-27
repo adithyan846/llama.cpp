@@ -422,6 +422,7 @@ struct vk_device_struct {
     bool subgroup_shuffle;
     bool subgroup_ballot;
     bool subgroup_clustered;
+    bool disable_subgroup;
     bool multi_add;
     bool shader_int64;
     bool buffer_device_address;
@@ -3959,6 +3960,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->subgroup_ballot = (vk11_props.subgroupSupportedStages & vk::ShaderStageFlagBits::eCompute) &&
                                   (vk11_props.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eBallot);
 
+        const bool disable_subgroup_env = getenv("GGML_VK_DISABLE_SUBGROUP") != nullptr;
+        device->disable_subgroup = disable_subgroup_env;
+        if (disable_subgroup_env) {
+            device->subgroup_arithmetic = false;
+            std::cerr << "ggml_vulkan: GGML_VK_DISABLE_SUBGROUP set, disabling subgroup operations" << std::endl;
+        }
+
         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
 
         device->fp16 = !force_disable_f16 && fp16_storage && fp16_compute;
@@ -4209,6 +4217,13 @@ static vk_device ggml_vk_get_device(size_t idx) {
         }
 
         if (!vk11_features.storageBuffer16BitAccess) {
+            if (getenv("GGML_VK_REQUIRE_16BIT_STORAGE")) {
+                std::cerr << "ggml_vulkan: FATAL: device "
+                          << GGML_VK_NAME << idx
+                          << " does not support 16-bit storage and GGML_VK_REQUIRE_16BIT_STORAGE is set."
+                          << std::endl;
+                GGML_ABORT("16-bit storage required but not available");
+            }
             std::cerr << "ggml_vulkan: WARNING: device "
                       << GGML_VK_NAME << idx
                       << " does not support 16-bit storage; continuing for testing."
@@ -4977,6 +4992,13 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
     VK_LOG_DEBUG("ggml_vk_get_dequantize_mul_mat_vec()");
     GGML_ASSERT(b_type == GGML_TYPE_F32 || b_type == GGML_TYPE_F16 || b_type == GGML_TYPE_Q8_1);
     GGML_ASSERT(num_cols >= 1 && num_cols <= mul_mat_vec_max_cols);
+
+    // Diagnostic logging for Adreno investigation
+    std::cerr << "ggml_vk_dmmv: a_type=" << ggml_type_name(a_type)
+              << " b_type=" << ggml_type_name(b_type)
+              << " num_cols=" << num_cols << " m=" << m << " k=" << k
+              << " use_subgroups=" << (ctx->device->subgroup_arithmetic ? 1 : 0)
+              << std::endl;
 
     if (b_type == GGML_TYPE_Q8_1) {
         switch (a_type) {
@@ -6637,6 +6659,15 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
                               { vk_subbuffer{ d_X, x_buf_offset, x_sz * ne02 * ne03 }, vk_subbuffer{ d_Y, y_buf_offset, y_sz_total }, vk_subbuffer{ d_D, d_buf_offset, d_sz * ne22 * ne23} },
                               pc, { groups_x, (uint32_t)(ne12 * ne13), groups_z });
+
+    // Diagnostic: dump first layer output when GGML_VK_DUMP_FIRST_LAYER is set
+    static int first_layer_counter = 0;
+    if (getenv("GGML_VK_DUMP_FIRST_LAYER") && first_layer_counter == 0) {
+        first_layer_counter++;
+        std::cerr << "ggml_vk_dmmv: dumping first layer output, d_ne=" << d_ne << " d_sz=" << d_sz << std::endl;
+        // Note: actual dump would require syncing the buffer back to host
+        // For now, just log that we would dump here
+    }
 
     if (x_non_contig) {
         ctx->prealloc_x_need_sync = true;
