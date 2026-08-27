@@ -423,6 +423,7 @@ struct vk_device_struct {
     bool subgroup_ballot;
     bool subgroup_clustered;
     bool disable_subgroup;
+    bool force_cpu_dequant;
     bool multi_add;
     bool shader_int64;
     bool buffer_device_address;
@@ -1516,11 +1517,13 @@ struct ggml_backend_vk_buffer_context {
     vk_device_ref device;
     vk_buffer dev_buffer;
     std::string name;
+    bool dequantized_to_f32;
 
     ggml_backend_vk_buffer_context(vk_device_ref device, vk_buffer&& dev_buffer, std::string& name) :
         device(device),
         dev_buffer(dev_buffer),
-        name(name) {
+        name(name),
+        dequantized_to_f32(false) {
     }
 
     ~ggml_backend_vk_buffer_context() {
@@ -3967,6 +3970,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
             std::cerr << "ggml_vulkan: GGML_VK_DISABLE_SUBGROUP set, disabling subgroup operations" << std::endl;
         }
 
+        const bool force_cpu_dequant_env = getenv("GGML_VK_FORCE_CPU_DEQUANT") != nullptr;
+        device->force_cpu_dequant = force_cpu_dequant_env;
+        if (force_cpu_dequant_env) {
+            std::cerr << "ggml_vulkan: GGML_VK_FORCE_CPU_DEQUANT set, will dequantize quantized weights on CPU" << std::endl;
+        }
+
         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
 
         device->fp16 = !force_disable_f16 && fp16_storage && fp16_compute;
@@ -4986,6 +4995,16 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_pipeline(ggml_backend_vk_conte
         return (ctx->device->fp16 && ctx->device->coopmat_acc_f16_support && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
     }
     return (ctx->device->fp16 && prec == GGML_PREC_DEFAULT) ? ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f16acc : ctx->device->pipeline_dequant_mul_mat_mat[src0_type].f32acc;
+}
+
+static ggml_type ggml_vk_get_dequantized_type(const ggml_tensor * tensor) {
+    if (tensor->buffer != nullptr && ggml_backend_buffer_is_vk(tensor->buffer)) {
+        ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+        if (buf_ctx->dequantized_to_f32 && ggml_is_quantized(tensor->type)) {
+            return GGML_TYPE_F32;
+        }
+    }
+    return tensor->type;
 }
 
 static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * ctx, ggml_type a_type, ggml_type b_type, uint32_t num_cols, uint32_t m, uint32_t k) {
@@ -6169,11 +6188,11 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     bool quantize_y = ctx->device->integer_dot_product && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1) && (ne11 * ne10) % 4 == 0;
 
     // Check for mmq first
-    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
+    vk_matmul_pipeline mmp = quantize_y ? ggml_vk_get_mul_mat_mat_pipeline(ctx, ggml_vk_get_dequantized_type(src0), GGML_TYPE_Q8_1, (ggml_prec)dst->op_params[0]) : nullptr;
 
     if (mmp == nullptr) {
         // Fall back to f16 dequant mul mat
-        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
+        mmp = ggml_vk_get_mul_mat_mat_pipeline(ctx, ggml_vk_get_dequantized_type(src0), y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
         quantize_y = false;
     }
 
@@ -6489,12 +6508,12 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
     }
 
     // Check for mmq first
-    vk_pipeline dmmv = quantize_y ? ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, GGML_TYPE_Q8_1, ne11, ne20, ne00) : nullptr;
+    vk_pipeline dmmv = quantize_y ? ggml_vk_get_dequantize_mul_mat_vec(ctx, ggml_vk_get_dequantized_type(src0), GGML_TYPE_Q8_1, ne11, ne20, ne00) : nullptr;
     vk_pipeline to_q8_1 = nullptr;
 
     if (dmmv == nullptr) {
         // Fall back to f16 dequant mul mat
-        dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, src0->type, src1->type, ne11, ne20, ne00);
+        dmmv = ggml_vk_get_dequantize_mul_mat_vec(ctx, ggml_vk_get_dequantized_type(src0), src1->type, ne11, ne20, ne00);
         quantize_y = false;
     }
 
@@ -6972,7 +6991,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     const bool y_f32_kernel = src1->type == GGML_TYPE_F32 && !y_non_contig;
 
-    vk_matmul_pipeline mmp = ggml_vk_get_mul_mat_mat_id_pipeline(ctx, src0->type, y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
+    vk_matmul_pipeline mmp = ggml_vk_get_mul_mat_mat_id_pipeline(ctx, ggml_vk_get_dequantized_type(src0), y_non_contig ? f16_type : src1->type, (ggml_prec)dst->op_params[0]);
 
     const bool qx_needs_dequant = mmp == nullptr || x_non_contig;
     const bool qy_needs_dequant = (src1->type != f16_type && !y_f32_kernel) || y_non_contig;
@@ -7228,7 +7247,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     } else {
         to_fp16_vk_1 = ggml_vk_get_to_fp16(ctx, src1->type);
     }
-    vk_pipeline dmmv = ggml_vk_get_dequantize_mul_mat_vec_id(ctx, src0->type, src1->type);
+    vk_pipeline dmmv = ggml_vk_get_dequantize_mul_mat_vec_id(ctx, ggml_vk_get_dequantized_type(src0), src1->type);
     GGML_ASSERT(!qx_needs_dequant || to_fp16_vk_0 != nullptr);  // NOLINT
     GGML_ASSERT(!qy_needs_dequant || to_fp16_vk_1 != nullptr);  // NOLINT
     GGML_ASSERT(dmmv != nullptr);
@@ -11941,6 +11960,19 @@ static enum ggml_status ggml_backend_vk_buffer_init_tensor(ggml_backend_buffer_t
     if (tensor->view_src != nullptr) {
         GGML_ASSERT(tensor->view_src->buffer->buft == buffer->buft);
     }
+
+    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
+    if (buf_ctx->device->force_cpu_dequant && ggml_is_quantized(tensor->type) && ggml_is_contiguous(tensor)) {
+        buf_ctx->dequantized_to_f32 = true;
+        tensor->extra = (void *)(intptr_t)tensor->type;
+        tensor->type = GGML_TYPE_F32;
+        tensor->nb[0] = ggml_type_size(GGML_TYPE_F32);
+        tensor->nb[1] = tensor->nb[0] * (tensor->ne[0] / ggml_blck_size(GGML_TYPE_F32));
+        for (int i = 2; i < GGML_MAX_DIMS; i++) {
+            tensor->nb[i] = tensor->nb[i - 1] * tensor->ne[i - 1];
+        }
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -11958,7 +11990,20 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
     vk_buffer buf = buf_ctx->dev_buffer;
 
-    ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+    if (buf_ctx->dequantized_to_f32 && tensor->extra != nullptr) {
+        const ggml_type original_type = (ggml_type)(intptr_t)tensor->extra;
+        const size_t ne = ggml_nelements(tensor);
+        const size_t f32_size = ne * sizeof(float);
+        float * f32_data = (float *) malloc(f32_size);
+        GGML_ASSERT(f32_data != nullptr);
+
+        ggml_vk_dequantize_data(data, f32_data, ne, original_type);
+
+        ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, f32_data, f32_size);
+        free(f32_data);
+    } else {
+        ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+    }
 }
 
 static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -12039,6 +12084,10 @@ static size_t ggml_backend_vk_buffer_type_get_max_size(ggml_backend_buffer_type_
 }
 
 static size_t ggml_backend_vk_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+    if (ctx->device->force_cpu_dequant && ggml_is_quantized(tensor->type)) {
+        return ggml_nelements(tensor) * sizeof(float);
+    }
     return ggml_nbytes(tensor);
 
     UNUSED(buft);
@@ -12165,7 +12214,6 @@ static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor
     vk_context transfer_ctx;
 
     if (ctx->transfer_ctx.expired()) {
-        // Initialize new transfer context
         transfer_ctx = ggml_vk_create_context(ctx, ctx->transfer_cmd_pool);
         ctx->transfer_ctx = transfer_ctx;
         ggml_vk_ctx_begin(ctx->device, transfer_ctx);
@@ -12175,7 +12223,20 @@ static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor
 
     vk_buffer buf = buf_ctx->dev_buffer;
 
-    ggml_vk_buffer_write_async(transfer_ctx, buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+    if (buf_ctx->dequantized_to_f32 && tensor->extra != nullptr) {
+        const ggml_type original_type = (ggml_type)(intptr_t)tensor->extra;
+        const size_t ne = ggml_nelements(tensor);
+        const size_t f32_size = ne * sizeof(float);
+        float * f32_data = (float *) malloc(f32_size);
+        GGML_ASSERT(f32_data != nullptr);
+
+        ggml_vk_dequantize_data(data, f32_data, ne, original_type);
+
+        ggml_vk_buffer_write_async(transfer_ctx, buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, f32_data, f32_size);
+        free(f32_data);
+    } else {
+        ggml_vk_buffer_write_async(transfer_ctx, buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+    }
 }
 
 static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
